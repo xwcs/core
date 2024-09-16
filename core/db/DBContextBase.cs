@@ -502,32 +502,69 @@ namespace xwcs.core.db
         {
             //CompleteEntity();
             CheckLoginForConnection();
-            if (ReferenceEquals(FeedbackAct,null)) {
-                return base.SaveChanges();
-            } else
+            int ret;
+            base.Database.Log?.Invoke(String.Format("<<<{0}.SaveChanges", this.GetType().Name));
+            try
             {
-                var tot = this.ChangeTracker.Entries().Where(e => e.State == EntityState.Modified || e.State == EntityState.Deleted || e.State == EntityState.Added).Select(ee => 1).Count();
-                var MyLog = this.Database.Log;
-                int curr = 0;
-                DateTime lastTimeUpdateSplash = DateTime.Today;
-                base.Database.Log = delegate (string l)
+                if (ReferenceEquals(FeedbackAct, null))
                 {
-                    MyLog?.Invoke(l);
-                    if (l.StartsWith("UPDATE") || l.StartsWith("DELETE") || l.StartsWith("INSERT"))
+                    ret = base.SaveChanges();
+                }
+                else
+                {
+                    var tot = this.ChangeTracker.Entries().Where(e => e.State == EntityState.Modified || e.State == EntityState.Deleted || e.State == EntityState.Added).Select(ee => 1).Count();
+                    var MyLog = this.Database.Log;
+                    int curr = 0;
+                    DateTime lastTimeUpdateSplash = DateTime.Today;
+                    base.Database.Log = delegate (string l)
                     {
-                        curr++;
-                    }
-                    if (curr>0 && (curr==1 || ((TimeSpan)(DateTime.Now - lastTimeUpdateSplash)).TotalSeconds >= 2)) //aggiornamento splash screen ogni 2 secondi
-                    {
-                        try { FeedbackAct.Invoke(curr, tot); } catch { }
-                        lastTimeUpdateSplash = DateTime.Now;
-                    }
-                };
-                var ret= base.SaveChanges();
-                this.Database.Log = MyLog;
+                        MyLog?.Invoke(l);
+                        if (
+                            l.StartsWith("UPDATE", StringComparison.CurrentCultureIgnoreCase)
+                            || l.StartsWith("DELETE", StringComparison.CurrentCultureIgnoreCase)
+                            || l.StartsWith("INSERT", StringComparison.CurrentCultureIgnoreCase)
+                            || l.IndexOf(";UPDATE", StringComparison.CurrentCultureIgnoreCase) > 0
+                            || l.IndexOf(";DELETE", StringComparison.CurrentCultureIgnoreCase) > 0
+                            || l.IndexOf(";INSERT", StringComparison.CurrentCultureIgnoreCase) > 0
+                            )
+                        {
+                            curr++;
+                            if (curr > 0 && (curr == 1 || curr == tot || ((TimeSpan)(DateTime.Now - lastTimeUpdateSplash)).TotalSeconds >= 2)) //aggiornamento splash screen ogni 2 secondi
+                            {
+                                try { FeedbackAct.Invoke(curr, tot); } catch { }
+                                lastTimeUpdateSplash = DateTime.Now;
+                            }
+                        }
+                        
+                    };
+                    ret = base.SaveChanges();
+                    this.Database.Log = MyLog;
+                }
+                base.Database.Log?.Invoke(">>>");
                 return ret;
             }
-            
+            catch (System.Data.Entity.Validation.DbEntityValidationException ex)
+            {
+                var s = String.Join("\r\n",
+                        ex.EntityValidationErrors.Select(e =>
+                            e.Entry.Entity.ToString() + ": " +
+                            String.Join(", ", e.ValidationErrors.Select(v => v.ErrorMessage))
+                          )
+                        );
+                base.Database.Log?.Invoke(String.Format(
+                    ">>>Exception {0}\r\n{1}", 
+                    ex, 
+                    s
+                      )
+                    );
+                throw new System.Data.Entity.Validation.DbEntityValidationException(s , ex);
+            }
+            catch (Exception ex)
+            {
+                base.Database.Log?.Invoke(String.Format(">>>Exception {0}", ex));
+                throw;
+            }
+
         }
 
         /*
@@ -599,13 +636,18 @@ namespace xwcs.core.db
                 (e.Entity as IModelEntity).SetCtx(this);
             }
         }
-
+        private const int _CONNECTION_WAIT_TIMEOUT_SEC = 259200; //3 giorni=259200
         private void Connection_StateChange(object sender, System.Data.StateChangeEventArgs e)
         {
+            
+            this.Database.Log?.Invoke(String.Format("from state {0} to state {1}", e.OriginalState.ToString(), e.CurrentState.ToString()));
             if (e.CurrentState == System.Data.ConnectionState.Open)
             {
                 DoLoginForConnection();
+                Database.ExecuteSqlCommand(string.Format("SET SESSION wait_timeout = {0};", _CONNECTION_WAIT_TIMEOUT_SEC));
+                Database.ExecuteSqlCommand(string.Format("SET SESSION interactive_timeout = {0};", _CONNECTION_WAIT_TIMEOUT_SEC));
             }
+            
         }
 
         public string CurrentConnectedUser
@@ -777,16 +819,36 @@ namespace xwcs.core.db
             string eid = e.GetLockId().ToString();
             string ename = e.GetFieldName(); // name of table
             CheckLoginForConnection();
-            LockResult lr = Database.SqlQuery<LockResult>(string.Format("call {0}.entity_lock({1}, '{2}', {3});", _adminDb, eid, ename, (persistent ? '1' : '0'))).FirstOrDefault();
-            Database.Log?.Invoke(String.Format("entity entity_lock({0}, {1}, {2}) return {3}, '{4}'", eid, ename, persistent, lr.Id_lock, lr.Owner));
-            if (lr.Id_lock == 0)
+            string sql = string.Format("call {0}.entity_lock({1}, '{2}', {3});", _adminDb, eid, ename, (persistent ? '1' : '0'));
+            LockResult lr;
+            try
             {
-                throw new DBLockException(lr);
+                lr = Database.SqlQuery<LockResult>(sql).FirstOrDefault();
+                Database.Log?.Invoke(String.Format("{0} return {1}, '{2}'", sql, lr.Id_lock, lr.Owner));
+                if (lr.Id_lock == 0)
+                {
+                    throw new DBLockException(lr);
+                }
+
+                // save lock internally
+                if (!(persistent)) _locks.Add(new LockData() { id = eid, entity = ename });
+            } catch (Exception ex)
+            {
+                DBLockException ddd;
+                if (ex is DBLockException)
+                {
+                    ddd = (DBLockException)ex;
+                }
+                else
+                {
+                    Database.Log?.Invoke(String.Format("{0} error {1}", sql, ex));
+                    lr = new LockResult();
+                    lr.Id_lock = 0;
+                    lr.Owner = "??";
+                    ddd = new DBLockException(lr);
+                }
+                throw ddd;
             }
-
-            // save lock internally
-            if (!(persistent)) _locks.Add(new LockData() { id = eid, entity = ename });
-
             return lr;
         }
 
@@ -1213,7 +1275,7 @@ namespace xwcs.core.db
             }
         }
 
-        public DataTable EntityDataTableHistory(string e, string idpropertyname="id")
+        public System.ComponentModel.IListSource EntityDataTableHistory(string e, string idpropertyname="id")
         {
 
             var ret = new DataTable();
